@@ -1,0 +1,4 @@
+shifts.json
+*.tmp
+.env
+__pycache__/
