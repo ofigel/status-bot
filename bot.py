@@ -5,7 +5,7 @@ import os
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -18,12 +18,16 @@ if not BOT_TOKEN:
 CHAT_ID = int(os.environ.get("CHAT_ID", "-1003771996489"))
 DATA_FILE = Path(os.environ.get("DATA_FILE", "shifts.json"))
 
-DEFAULT_TZ = "Asia/Manila"
+DEFAULT_TZ = os.environ.get("DEFAULT_TZ", "Asia/Manila")
 
-USER_TIMEZONES = {
+USER_TIMEZONES_BY_ID = {
     # Telegram user_id: timezone
     # 123456789: "Asia/Manila",
     # 987654321: "Asia/Jerusalem",
+}
+
+USER_TIMEZONES_BY_USERNAME = {
+    "alexshatsky": "Asia/Jerusalem",
 }
 
 LOCK = asyncio.Lock()
@@ -50,9 +54,26 @@ def save_data(data: dict) -> None:
     tmp_file.replace(DATA_FILE)
 
 
-def get_user_tz(user_id: int) -> ZoneInfo:
-    tz_name = USER_TIMEZONES.get(user_id, DEFAULT_TZ)
-    return ZoneInfo(tz_name)
+def get_configured_tz_name(user) -> str:
+    if user.id in USER_TIMEZONES_BY_ID:
+        return USER_TIMEZONES_BY_ID[user.id]
+
+    username = (user.username or "").lower()
+    if username in USER_TIMEZONES_BY_USERNAME:
+        return USER_TIMEZONES_BY_USERNAME[username]
+
+    return DEFAULT_TZ
+
+
+def get_user_tz_name(record: dict, user) -> str:
+    if record and record.get("timezone"):
+        return record["timezone"]
+
+    return get_configured_tz_name(user)
+
+
+def get_user_tz(record: dict, user) -> ZoneInfo:
+    return ZoneInfo(get_user_tz_name(record, user))
 
 
 def format_duration(minutes: float) -> str:
@@ -75,7 +96,7 @@ def get_or_create_user(data: dict, user) -> dict:
         data[uid] = {
             "name": user.first_name or "",
             "username": user.username or "",
-            "timezone": USER_TIMEZONES.get(user.id, DEFAULT_TZ),
+            "timezone": get_configured_tz_name(user),
             "active_start": None,
             "last_worked_out": None,
             "shifts": [],
@@ -83,7 +104,9 @@ def get_or_create_user(data: dict, user) -> dict:
 
     data[uid]["name"] = user.first_name or ""
     data[uid]["username"] = user.username or ""
-    data[uid]["timezone"] = USER_TIMEZONES.get(user.id, data[uid].get("timezone", DEFAULT_TZ))
+
+    if not data[uid].get("timezone"):
+        data[uid]["timezone"] = get_configured_tz_name(user)
 
     return data[uid]
 
@@ -97,15 +120,13 @@ async def shift_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user = update.effective_user
-    uid = str(user.id)
-
     current_utc = now_utc()
-    local_tz = get_user_tz(user.id)
-    local_time = current_utc.astimezone(local_tz)
 
     async with LOCK:
         data = load_data()
         record = get_or_create_user(data, user)
+        local_tz = get_user_tz(record, user)
+        local_time = current_utc.astimezone(local_tz)
 
         if record.get("active_start"):
             await update.message.reply_text(
@@ -131,12 +152,12 @@ async def shift_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = update.effective_user
     current_utc = now_utc()
-    local_tz = get_user_tz(user.id)
-    local_time = current_utc.astimezone(local_tz)
 
     async with LOCK:
         data = load_data()
         record = get_or_create_user(data, user)
+        local_tz = get_user_tz(record, user)
+        local_time = current_utc.astimezone(local_tz)
 
         active_start = record.get("active_start")
 
@@ -174,12 +195,12 @@ async def worked_out(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = update.effective_user
     current_utc = now_utc()
-    local_tz = get_user_tz(user.id)
-    local_time = current_utc.astimezone(local_tz)
 
     async with LOCK:
         data = load_data()
         record = get_or_create_user(data, user)
+        local_tz = get_user_tz(record, user)
+        local_time = current_utc.astimezone(local_tz)
 
         if record.get("active_start"):
             await update.message.reply_text(
@@ -215,6 +236,69 @@ async def worked_out(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML")
 
 
+async def set_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed_chat(update):
+        return
+
+    user = update.effective_user
+
+    if len(context.args) != 1:
+        await update.message.reply_text(
+            "Usage: /set_tz Asia/Jerusalem or /set_tz Asia/Manila"
+        )
+        return
+
+    tz_name = context.args[0].strip()
+
+    try:
+        ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        await update.message.reply_text(
+            f"⚠️ Unknown timezone: {escape(tz_name)}",
+            parse_mode="HTML",
+        )
+        return
+
+    current_utc = now_utc()
+    local_time = current_utc.astimezone(ZoneInfo(tz_name))
+
+    async with LOCK:
+        data = load_data()
+        record = get_or_create_user(data, user)
+        record["timezone"] = tz_name
+        save_data(data)
+
+    await update.message.reply_text(
+        f"✅ <b>{escape(user_label(user))}</b> timezone set to <b>{escape(tz_name)}</b>\n"
+        f"Local time now: <b>{local_time:%Y-%m-%d %H:%M}</b>",
+        parse_mode="HTML",
+    )
+
+
+async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed_chat(update):
+        return
+
+    user = update.effective_user
+    current_utc = now_utc()
+
+    async with LOCK:
+        data = load_data()
+        record = get_or_create_user(data, user)
+        local_tz = get_user_tz(record, user)
+        local_time = current_utc.astimezone(local_tz)
+        save_data(data)
+
+    text = (
+        f"👤 <b>{escape(user_label(user))}</b>\n"
+        f"Telegram ID: <code>{user.id}</code>\n"
+        f"Timezone: <b>{escape(local_tz.key)}</b>\n"
+        f"Local time: <b>{local_time:%Y-%m-%d %H:%M}</b>"
+    )
+
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
 def main():
     logging.basicConfig(level=logging.INFO)
 
@@ -223,6 +307,8 @@ def main():
     app.add_handler(CommandHandler("shift_start", shift_start))
     app.add_handler(CommandHandler("shift_end", shift_end))
     app.add_handler(CommandHandler("worked_out", worked_out))
+    app.add_handler(CommandHandler("set_tz", set_timezone))
+    app.add_handler(CommandHandler("whoami", whoami))
 
     logging.info("Bot is running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
